@@ -1,0 +1,63 @@
+# .gitlab-ci.yml — example pipeline for a repo that Pipeline Paramedic monitors
+# This goes in YOUR PROJECT, not the paramedic repo itself.
+
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  PYTHON_VERSION: "3.12"
+
+# Notify Pipeline Paramedic on failure via webhook
+.notify_paramedic: &notify_paramedic
+  after_script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        curl -s -X POST "$PARAMEDIC_WEBHOOK_URL/webhook/gitlab" \
+          -H "X-Gitlab-Token: $PARAMEDIC_WEBHOOK_SECRET" \
+          -H "X-Gitlab-Event: Pipeline Hook" \
+          -H "Content-Type: application/json" \
+          -d "{
+            \"object_kind\": \"pipeline\",
+            \"object_attributes\": {
+              \"id\": $CI_PIPELINE_ID,
+              \"ref\": \"$CI_COMMIT_REF_NAME\",
+              \"sha\": \"$CI_COMMIT_SHA\",
+              \"status\": \"failed\"
+            },
+            \"project\": { \"id\": $CI_PROJECT_ID, \"name\": \"$CI_PROJECT_NAME\" },
+            \"builds\": [{ \"id\": $CI_JOB_ID, \"name\": \"$CI_JOB_NAME\", \"status\": \"failed\" }],
+            \"commit\": { \"id\": \"$CI_COMMIT_SHA\" },
+            \"merge_request\": { \"iid\": ${CI_MERGE_REQUEST_IID:-null} }
+          }"
+      fi
+
+lint:
+  stage: lint
+  image: python:$PYTHON_VERSION-slim
+  <<: *notify_paramedic
+  script:
+    - pip install flake8 black isort --quiet
+    - flake8 . --max-line-length=120 --exclude=.git,__pycache__
+    - black --check .
+    - isort --check-only .
+
+test:
+  stage: test
+  image: python:$PYTHON_VERSION-slim
+  <<: *notify_paramedic
+  script:
+    - pip install -r requirements.txt pytest --quiet
+    - pytest tests/ -v --tb=short
+
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:dind
+  script:
+    - docker build -t $CI_PROJECT_NAME:$CI_COMMIT_SHA .
+  only:
+    - main
+    - merge_requests

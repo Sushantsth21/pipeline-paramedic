@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker --version)",
+      "Bash(gcloud --version)",
+      "Bash(terraform --version)"
+    ]
+  }
+}
