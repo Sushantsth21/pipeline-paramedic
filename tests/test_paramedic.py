@@ -78,9 +78,8 @@ class TestPipelineParamedic:
 
     @patch("src.agent.paramedic.GitLabTools")
     @patch("src.agent.paramedic.CodeTools")
-    @patch("src.agent.paramedic.vertexai")
-    @patch("src.agent.paramedic.GenerativeModel")
-    def test_extracts_correct_context(self, mock_model_cls, mock_vai, mock_code, mock_gl):
+    @patch("src.agent.paramedic.genai")
+    def test_extracts_correct_context(self, mock_genai, mock_code, mock_gl):
         from src.agent.paramedic import PipelineParamedic
         agent = PipelineParamedic.__new__(PipelineParamedic)
         agent.gitlab = MagicMock()
@@ -99,9 +98,8 @@ class TestPipelineParamedic:
 
     @patch("src.agent.paramedic.GitLabTools")
     @patch("src.agent.paramedic.CodeTools")
-    @patch("src.agent.paramedic.vertexai")
-    @patch("src.agent.paramedic.GenerativeModel")
-    def test_low_confidence_posts_triage(self, mock_model_cls, mock_vai, mock_code, mock_gl):
+    @patch("src.agent.paramedic.genai")
+    def test_low_confidence_posts_triage(self, mock_genai, mock_code, mock_gl):
         from src.agent.paramedic import PipelineParamedic
         agent = PipelineParamedic.__new__(PipelineParamedic)
         agent.gitlab = MagicMock()
