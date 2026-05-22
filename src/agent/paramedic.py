@@ -10,17 +10,15 @@ import textwrap
 from dataclasses import dataclass
 from typing import Optional
 
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel
+import google.generativeai as genai
 
 from src.tools.gitlab_tools import GitLabTools
 from src.tools.code_tools import CodeTools
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "your-gcp-project-id")
-LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
-GEMINI_MODEL = "gemini-2.0-flash-001"
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 
 @dataclass
@@ -57,8 +55,8 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 class PipelineParamedic:
     def __init__(self):
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
-        self.model = GenerativeModel(
+        genai.configure(api_key=GEMINI_API_KEY)
+        self.model = genai.GenerativeModel(
             GEMINI_MODEL,
             system_instruction=SYSTEM_PROMPT,
         )
