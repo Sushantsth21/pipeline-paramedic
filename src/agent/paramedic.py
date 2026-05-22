@@ -147,7 +147,7 @@ class PipelineParamedic:
 
     def _find_mr_iid(self, payload: dict) -> Optional[int]:
         """Extract MR IID from merge_request object if present."""
-        mr = payload.get("merge_request", {})
+        mr = payload.get("merge_request") or {}
         return mr.get("iid")
 
     def _diagnose(self, job_log: str, commit_diff: str, ctx: dict) -> dict:
