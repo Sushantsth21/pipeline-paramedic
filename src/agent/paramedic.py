@@ -3,10 +3,12 @@ Pipeline Paramedic — Core Agent
 Orchestrates the fix cycle: fetch logs → reason → fix → push → comment.
 """
 
+import json
 import logging
 import os
 import re
 import textwrap
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -150,36 +152,45 @@ class PipelineParamedic:
 
     def _diagnose(self, job_log: str, commit_diff: str, ctx: dict) -> dict:
         """Send log + diff to Gemini and parse the structured response."""
-        # Trim log to last 200 lines to stay within token limits
-        trimmed_log = "\n".join(job_log.splitlines()[-200:])
+        # Trim aggressively to stay within free-tier token limits
+        trimmed_log = "\n".join(job_log.splitlines()[-100:])
 
         prompt = textwrap.dedent(f"""
-            ## Failing Job Log (last 200 lines)
+            ## Failing Job Log (last 100 lines)
             ```
             {trimmed_log}
             ```
 
             ## Commit Diff that triggered this pipeline
             ```diff
-            {commit_diff[:4000]}
+            {commit_diff[:2000]}
             ```
 
             ## Context
             - Branch: {ctx['branch']}
-            - Pipeline ID: {ctx['pipeline_id']}
             - Commit SHA: {ctx['commit_sha']}
 
             Diagnose the failure and respond with JSON only.
         """).strip()
 
-        response = self.model.generate_content(prompt)
+        # Retry up to 3 times with backoff for rate limit errors
+        for attempt in range(3):
+            try:
+                response = self.model.generate_content(prompt)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise
+                wait = 30 * (attempt + 1)
+                logger.warning(f"Gemini rate limit hit, retrying in {wait}s (attempt {attempt + 1})")
+                time.sleep(wait)
+
         raw = response.text.strip()
 
         # Strip accidental markdown fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
 
-        import json
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
