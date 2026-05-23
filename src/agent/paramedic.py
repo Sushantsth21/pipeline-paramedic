@@ -12,7 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from src.tools.gitlab_tools import GitLabTools
 from src.tools.code_tools import CodeTools
@@ -57,11 +58,7 @@ SYSTEM_PROMPT = textwrap.dedent("""
 
 class PipelineParamedic:
     def __init__(self):
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel(
-            GEMINI_MODEL,
-            system_instruction=SYSTEM_PROMPT,
-        )
+        self.client = genai.Client(api_key=GEMINI_API_KEY)
         self.gitlab = GitLabTools()
         self.code = CodeTools()
 
@@ -176,7 +173,13 @@ class PipelineParamedic:
         # Retry up to 3 times with backoff for rate limit errors
         for attempt in range(3):
             try:
-                response = self.model.generate_content(prompt)
+                response = self.client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                    ),
+                )
                 break
             except Exception as e:
                 if attempt == 2:

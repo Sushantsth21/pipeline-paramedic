@@ -12,6 +12,7 @@ variable "region"     { default = "us-central1" }
 variable "gitlab_token"          { sensitive = true }
 variable "gitlab_webhook_secret" { sensitive = true }
 
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -66,6 +67,19 @@ resource "google_secret_manager_secret_iam_member" "paramedic_webhook_secret" {
   member    = "serviceAccount:${google_service_account.paramedic.email}"
 }
 
+resource "google_secret_manager_secret" "gemini_api_key" {
+  secret_id = "gemini-api-key"
+  replication {
+    auto {}
+  }
+}
+
+resource "google_secret_manager_secret_iam_member" "paramedic_gemini_api_key" {
+  secret_id = google_secret_manager_secret.gemini_api_key.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.paramedic.email}"
+}
+
 # Cloud Run service
 resource "google_cloud_run_v2_service" "paramedic" {
   name     = "pipeline-paramedic"
@@ -106,6 +120,17 @@ resource "google_cloud_run_v2_service" "paramedic" {
           }
         }
       }
+
+      env {
+        name = "GEMINI_API_KEY"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.gemini_api_key.secret_id
+            version = "latest"
+          }
+        }
+      }
+
     }
 
     scaling {
