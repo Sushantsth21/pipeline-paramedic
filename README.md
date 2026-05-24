@@ -1,8 +1,22 @@
 # Pipeline Paramedic
 
-> An autonomous CI/CD repair agent — powered by Gemini 2.5 Flash and the GitLab REST API.
+> An autonomous CI/CD repair agent — powered by Gemini 3 Flash and the GitLab REST API.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+---
+
+## Roadmap
+
+- [x] Core agent — fetch logs, diagnose with Gemini, patch files, commit, post MR comment, retry pipeline
+- [x] Multi-file fix in a single commit
+- [x] Upgrade to Gemini 3 (`gemini-3-flash-preview`)
+- [ ] Wire up the real GitLab MCP server (currently calls GitLab REST API directly)
+- [ ] Async webhook handling via Cloud Tasks (currently blocks until agent finishes — can time out)
+- [ ] Human-in-the-loop approval for medium-confidence fixes (post MR comment asking for sign-off before committing)
+- [ ] Auto-re-enable disabled webhooks via GitLab API (GitLab disables webhooks after repeated failures)
+- [ ] Record 3-minute demo video showing end-to-end fix on a real repo
+- [ ] Devpost submission write-up
 
 ---
 
