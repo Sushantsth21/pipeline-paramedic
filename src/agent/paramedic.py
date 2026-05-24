@@ -9,7 +9,7 @@ import os
 import re
 import textwrap
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from google import genai
@@ -20,7 +20,7 @@ from src.tools.code_tools import CodeTools
 
 logger = logging.getLogger(__name__)
 
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 
@@ -29,6 +29,7 @@ class FixResult:
     success: bool
     diagnosis: str
     fix_description: str
+    files_fixed: list = field(default_factory=list)
     commit_sha: Optional[str] = None
     mr_comment_posted: bool = False
     error: Optional[str] = None
@@ -39,20 +40,29 @@ SYSTEM_PROMPT = textwrap.dedent("""
     broken CI/CD pipelines. Your job:
 
     1. Analyse the failing job log provided.
-    2. Identify the ROOT CAUSE precisely (linter error, syntax error, failing test,
-       missing dependency, type error, etc.).
-    3. Identify the EXACT FILE and LINE NUMBER if visible in the log.
-    4. Provide a structured JSON response with these fields:
-       - "root_cause": short one-sentence description
-       - "error_type": one of [lint, syntax, test_failure, import_error, type_error, other]
-       - "file_path": relative path to the file that needs fixing (null if unknown)
-       - "line_number": integer line number (null if unknown)
-       - "fix_description": one sentence describing what to change
-       - "fix_patch": a unified diff patch string to apply (null if you cannot determine it)
-       - "confidence": "high" | "medium" | "low"
-       - "human_summary": friendly 1-2 sentence summary to post as an MR comment
+    2. Identify ALL files and errors reported (there may be more than one).
+    3. For each file that needs a fix, produce a unified diff patch.
+    4. Respond ONLY with valid JSON in this exact shape — no markdown fences, no extra text:
 
-    Respond ONLY with valid JSON. No markdown fences, no extra text.
+    {
+      "root_cause": "short one-sentence description of the overall failure",
+      "error_type": "one of: lint | syntax | test_failure | import_error | type_error | other",
+      "confidence": "high | medium | low",
+      "human_summary": "friendly 1-2 sentence summary to post as an MR comment",
+      "fixes": [
+        {
+          "file_path": "relative/path/to/file.py",
+          "fix_description": "one sentence describing the change",
+          "fix_patch": "unified diff patch string, or null if unknown"
+        }
+      ]
+    }
+
+    Rules:
+    - Include every file that has an error in the log — do not stop at the first one.
+    - File paths must be relative with no leading ./ or /.
+    - If you cannot determine a patch for a file, set fix_patch to null.
+    - If overall confidence is low, set fixes to an empty array [].
 """).strip()
 
 
@@ -79,8 +89,10 @@ class PipelineParamedic:
         diagnosis = self._diagnose(job_log, commit_diff, ctx)
         logger.info(f"Diagnosis: {diagnosis}")
 
-        if diagnosis.get("confidence") == "low" or not diagnosis.get("fix_patch"):
-            # Cannot auto-fix — post an informational comment instead
+        fixes = diagnosis.get("fixes", [])
+        actionable = [f for f in fixes if f.get("fix_patch")]
+
+        if diagnosis.get("confidence") == "low" or not actionable:
             comment = self._build_triage_comment(diagnosis)
             self.gitlab.post_mr_comment(ctx["project_id"], ctx["mr_iid"], comment)
             return FixResult(
@@ -90,17 +102,16 @@ class PipelineParamedic:
                 mr_comment_posted=True,
             ).__dict__
 
-        # Step 3 — Apply the fix
-        commit_sha = self.code.apply_fix(
+        # Step 3 — Apply all fixes in a single commit
+        commit_sha, files_fixed = self.code.apply_all_fixes(
             project_id=ctx["project_id"],
             branch=ctx["branch"],
-            file_path=diagnosis["file_path"],
-            patch=diagnosis["fix_patch"],
-            commit_message=f"fix(paramedic): {diagnosis['fix_description']}",
+            fixes=actionable,
+            commit_message=f"fix(paramedic): {diagnosis.get('root_cause', 'fix CI failures')}",
         )
 
         # Step 4 — Post MR comment
-        comment = self._build_fix_comment(diagnosis, commit_sha)
+        comment = self._build_fix_comment(diagnosis, commit_sha, files_fixed)
         self.gitlab.post_mr_comment(ctx["project_id"], ctx["mr_iid"], comment)
 
         # Step 5 — Trigger pipeline retry
@@ -109,7 +120,8 @@ class PipelineParamedic:
         return FixResult(
             success=True,
             diagnosis=diagnosis["root_cause"],
-            fix_description=diagnosis["fix_description"],
+            fix_description=diagnosis.get("human_summary", ""),
+            files_fixed=files_fixed,
             commit_sha=commit_sha,
             mr_comment_posted=True,
         ).__dict__
@@ -124,7 +136,6 @@ class PipelineParamedic:
         project = payload.get("project", {})
         commit = payload.get("commit", {}) or attrs.get("commit", {})
 
-        # GitLab Pipeline Hook structure
         return {
             "project_id": project.get("id") or payload.get("project_id"),
             "pipeline_id": attrs.get("id") or payload.get("pipeline_id"),
@@ -139,7 +150,6 @@ class PipelineParamedic:
         for build in payload.get("builds", []):
             if build.get("status") == "failed":
                 return build["id"]
-        # Job Hook sends the job id directly
         return payload.get("build_id") or payload.get("id")
 
     def _find_mr_iid(self, payload: dict) -> Optional[int]:
@@ -149,7 +159,6 @@ class PipelineParamedic:
 
     def _diagnose(self, job_log: str, commit_diff: str, ctx: dict) -> dict:
         """Send log + diff to Gemini and parse the structured response."""
-        # Trim aggressively to stay within free-tier token limits
         trimmed_log = "\n".join(job_log.splitlines()[-100:])
 
         prompt = textwrap.dedent(f"""
@@ -167,10 +176,9 @@ class PipelineParamedic:
             - Branch: {ctx['branch']}
             - Commit SHA: {ctx['commit_sha']}
 
-            Diagnose the failure and respond with JSON only.
+            Diagnose ALL failures and respond with JSON only.
         """).strip()
 
-        # Retry up to 3 times with backoff for rate limit errors
         for attempt in range(3):
             try:
                 response = self.client.models.generate_content(
@@ -189,25 +197,29 @@ class PipelineParamedic:
                 time.sleep(wait)
 
         raw = response.text.strip()
-
-        # Strip accidental markdown fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
 
         try:
-            return json.loads(raw)
+            parsed = json.loads(raw)
+            # Normalize file paths — GitLab API rejects leading ./ or /
+            for fix in parsed.get("fixes", []):
+                if fix.get("file_path"):
+                    fix["file_path"] = fix["file_path"].lstrip("./").lstrip("/")
+            return parsed
         except json.JSONDecodeError:
             logger.error(f"Gemini returned non-JSON: {raw[:500]}")
             return {
                 "root_cause": "Could not parse Gemini response",
                 "confidence": "low",
-                "fix_patch": None,
+                "fixes": [],
                 "human_summary": "The Pipeline Paramedic could not determine an automatic fix. Please review the job log manually.",
             }
 
     @staticmethod
-    def _build_fix_comment(diagnosis: dict, commit_sha: str) -> str:
-        summary = diagnosis.get("human_summary", diagnosis.get("fix_description", ""))
+    def _build_fix_comment(diagnosis: dict, commit_sha: str, files_fixed: list) -> str:
+        files_list = "\n".join(f"- `{f}`" for f in files_fixed)
+        summary = diagnosis.get("human_summary", "")
         return textwrap.dedent(f"""
             ## 🚑 Pipeline Paramedic — Auto-fix Applied
 
@@ -215,8 +227,11 @@ class PipelineParamedic:
 
             {summary}
 
-            I've pushed commit `{commit_sha[:8]}` to fix the issue and re-triggered the pipeline.
-            Please review the change and let me know if anything looks wrong.
+            **Files fixed ({len(files_fixed)}):**
+            {files_list}
+
+            Pushed commit `{commit_sha[:8]}` and re-triggered the pipeline.
+            Please review the changes and let me know if anything looks wrong.
 
             > *Automated fix by [Pipeline Paramedic](https://github.com/your-username/pipeline-paramedic)*
         """).strip()

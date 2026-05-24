@@ -1,233 +1,458 @@
-# 🚑 Pipeline Paramedic
+# Pipeline Paramedic
 
-> **An autonomous CI/CD repair agent** — powered by Gemini and Google Cloud Agent Builder, integrated with the GitLab MCP server.
+> An autonomous CI/CD repair agent — powered by Gemini 2.5 Flash and the GitLab REST API.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Hackathon: Rapid Agent](https://img.shields.io/badge/Hackathon-Rapid_Agent-purple)](https://rapid-agent.devpost.com)
-[![Track: GitLab](https://img.shields.io/badge/Track-GitLab-orange)](https://rapid-agent.devpost.com/details/gitlab-resources)
 
 ---
 
-## The Problem
+## What It Does
 
-When a CI/CD pipeline breaks — a missing semicolon, a linter violation, an undefined variable — developers must **stop what they're doing**, dig through logs, find the error, apply a tiny fix, and push again. This is pure friction on a low-value chore.
+When a GitLab CI/CD pipeline fails, Pipeline Paramedic:
 
-## The Solution
+1. Receives the failure webhook from GitLab
+2. Fetches the failing job log and the commit diff
+3. Sends both to Gemini 2.5 Flash for diagnosis
+4. Identifies **all** files with errors — not just the first one
+5. Patches every affected file, commits all fixes in a single commit, posts an MR comment, and re-triggers the pipeline
+6. If confidence is low or no patch can be determined — posts a triage comment instead
 
-**Pipeline Paramedic** is an autonomous agent that:
-
-1. **Listens** for a `pipeline failed` webhook from GitLab
-2. **Fetches** the failing job log and the commit diff via the **GitLab MCP server**
-3. **Reasons** with **Gemini** to identify the root cause and generate a precise fix
-4. **Applies** the fix by committing the patched file back to the branch
-5. **Posts** an MR comment explaining what it did, then re-triggers the pipeline
-
-The developer never leaves their current task.
+The developer never has to leave their current task for a simple linter or syntax error.
 
 ---
 
 ## Architecture
 
 ```
-GitLab CI (pipeline fails)
-        │  webhook
-        ▼
-Google Cloud Run  ──────────►  Google Cloud Agent Builder
-  (receiver.py)                        │
-                                       │  orchestrates
-                              ┌────────┴────────┐
-                              ▼                 ▼
-                         GitLab MCP          Gemini
-                       (fetch logs,        (diagnose +
-                        diff, commit,       generate fix)
-                        post comment)
-                              │
-                              ▼
-                    Auto-fix commit pushed
-                    MR comment posted
-                    Pipeline retried
+GitLab CI pipeline fails
+         │
+         │  Pipeline Hook webhook (POST /webhook/gitlab)
+         ▼
+┌─────────────────────┐
+│   Flask Web Server  │  (Cloud Run in production)
+│   receiver.py       │
+│                     │
+│  1. Verify token    │
+│  2. Filter "failed" │
+│  3. Hand off        │
+└────────┬────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────┐
+│   PipelineParamedic Agent  (paramedic.py)           │
+│                                                     │
+│  Step 1 ── extract context from payload             │
+│            (project_id, job_id, branch, sha, mr)    │
+│                                                     │
+│  Step 2 ── GitLabTools.get_job_log()                │
+│            GitLabTools.get_commit_diff()            │
+│                 │                                   │
+│                 ▼                                   │
+│  Step 3 ── Gemini 2.5 Flash                        │
+│            (trimmed log + diff → JSON with          │
+│             "fixes" array covering ALL files)       │
+│                 │                                   │
+│         ┌───── ▼ ─────┐                            │
+│   high/medium       low / no patches                │
+│   confidence              │                         │
+│         │                 ▼                         │
+│  Step 4 │        post triage MR comment             │
+│  CodeTools.apply_all_fixes()                        │
+│  (fetch each file → patch → single commit)          │
+│         │                                           │
+│  Step 5 ── post fix MR comment (lists all files)   │
+│         ── GitLabTools.retry_pipeline()             │
+└─────────────────────────────────────────────────────┘
 ```
 
----
+### Component breakdown
 
-## Hackathon Track
-
-- **Primary track:** GitLab (required MCP integration)
-- **Gemini model:** `gemini-2.0-flash-001` via Vertex AI
-- **Infrastructure:** Google Cloud Run + Cloud Build + Secret Manager
-
----
-
-## Project Structure
-
-```
-pipeline-paramedic/
-├── main.py                          # App entrypoint
-├── requirements.txt
-├── Dockerfile
-├── cloudbuild.yaml                  # Cloud Build CI/CD
-├── terraform/
-│   └── main.tf                      # All GCP resources as IaC
-├── src/
-│   ├── webhook/
-│   │   └── receiver.py              # Flask webhook endpoint
-│   ├── agent/
-│   │   └── paramedic.py             # Core agent orchestrator
-│   └── tools/
-│       ├── gitlab_tools.py          # GitLab MCP integration
-│       └── code_tools.py            # Patch applier + commit logic
-├── tests/
-│   └── test_paramedic.py
-└── docs/
-    ├── example-target-gitlab-ci.yml # How to configure target repos
-    └── SETUP.md                     # Step-by-step setup guide
-```
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Google Cloud project with billing enabled
-- GitLab account (cloud or self-managed)
-- `gcloud` CLI authenticated
-- Terraform >= 1.5
-
-### 1. Clone and configure
-
-```bash
-git clone https://github.com/your-username/pipeline-paramedic
-cd pipeline-paramedic
-cp .env.example .env
-# Edit .env with your values
-```
-
-### 2. Set environment variables
-
-```bash
-export GCP_PROJECT_ID="your-gcp-project-id"
-export GITLAB_TOKEN="glpat-xxxxxxxxxxxxxxxxxxxx"   # needs api + write_repository scope
-export GITLAB_WEBHOOK_SECRET="your-random-secret"
-export GITLAB_URL="https://gitlab.com"              # or your self-managed URL
-```
-
-### 3. Deploy with Terraform
-
-```bash
-cd terraform
-terraform init
-terraform apply \
-  -var="project_id=$GCP_PROJECT_ID" \
-  -var="gitlab_token=$GITLAB_TOKEN" \
-  -var="gitlab_webhook_secret=$GITLAB_WEBHOOK_SECRET"
-```
-
-Terraform outputs your webhook URL:
-```
-webhook_url = "https://pipeline-paramedic-xxxx-uc.a.run.app/webhook/gitlab"
-```
-
-### 4. Build and deploy the container
-
-```bash
-gcloud builds submit --config cloudbuild.yaml
-```
-
-### 5. Configure GitLab webhook
-
-In your GitLab project → **Settings → Webhooks**:
-
-| Field | Value |
+| File | Role |
 |---|---|
-| URL | `https://pipeline-paramedic-xxxx-uc.a.run.app/webhook/gitlab` |
-| Secret token | `your-random-secret` |
-| Trigger | ✅ Pipeline events |
-
-### 6. Configure the target repo's `.gitlab-ci.yml`
-
-See [`docs/example-target-gitlab-ci.yml`](docs/example-target-gitlab-ci.yml) for a drop-in template. Add two CI/CD variables to your GitLab project:
-
-- `PARAMEDIC_WEBHOOK_URL` — your Cloud Run URL
-- `PARAMEDIC_WEBHOOK_SECRET` — your webhook secret
+| `main.py` | Entrypoint — imports Flask app and sets port |
+| `src/webhook/receiver.py` | Flask server; verifies webhook token; routes to agent |
+| `src/agent/paramedic.py` | Orchestrates the full fix cycle; calls Gemini |
+| `src/tools/gitlab_tools.py` | Wraps GitLab REST API v4 (logs, diffs, commits, MR notes, pipeline retry) |
+| `src/tools/code_tools.py` | Applies unified diff patches in memory; commits via GitLab API |
+| `terraform/main.tf` | All GCP infrastructure as code |
+| `cloudbuild.yaml` | CI/CD: test → build → push → deploy to Cloud Run |
+| `tests/test_paramedic.py` | Unit tests for patch applier and agent orchestration |
 
 ---
 
 ## How It Works — Step by Step
 
-### Step 1 — Webhook received
+### 1. Webhook received
 
-GitLab fires a `Pipeline Hook` event when a pipeline fails. Cloud Run receives it, verifies the secret token, and hands the payload to the agent.
+GitLab fires a `Pipeline Hook` event on failure. The Flask receiver at `/webhook/gitlab`:
+- Checks `X-Gitlab-Token` header against `GITLAB_WEBHOOK_SECRET`
+- Ignores any event type other than `Pipeline Hook` or `Job Hook`
+- Ignores any pipeline with status other than `failed`
+- Returns a clean response for non-failure events so GitLab does not disable the webhook
 
-### Step 2 — GitLab MCP: Fetch artefacts
+### 2. Context extraction
 
-The agent uses the GitLab MCP tools to:
-- `get_job_log(project_id, job_id)` — fetches the full console output (last 200 lines used)
-- `get_commit_diff(project_id, commit_sha)` — fetches the unified diff of the triggering commit
+The payload is normalised into a flat context dict:
 
-### Step 3 — Gemini reasoning
-
-The trimmed log + diff are sent to `gemini-2.0-flash-001` with a structured system prompt. Gemini returns JSON:
-
-```json
+```python
 {
-  "root_cause": "flake8 E501 line too long on line 42 of src/auth.py",
-  "error_type": "lint",
-  "file_path": "src/auth.py",
-  "line_number": 42,
-  "fix_description": "Wrap the long line to stay under 120 characters",
-  "fix_patch": "@@ -41,3 +41,4 @@\n ...",
-  "confidence": "high",
-  "human_summary": "I noticed the linter failed due to a line exceeding 120 characters..."
+    "project_id": 82455138,
+    "pipeline_id": 2547342256,
+    "job_id": 14511776899,   # first failed build in the builds array
+    "branch": "main",
+    "commit_sha": "7d82a30...",
+    "mr_iid": 7              # None if no open MR — comment is silently skipped
 }
 ```
 
-### Step 4 — Apply fix
+Both `Pipeline Hook` and `Job Hook` payload shapes are handled.
 
-If confidence is `high` or `medium` and a patch is provided:
-1. `get_file_content` fetches the current file from the branch
-2. The unified diff patch is applied in-memory
-3. `create_commit` pushes the change back via GitLab Commits API — **no local git clone needed**
+### 3. GitLab artefacts fetched
 
-If confidence is `low` or no patch is available, a triage comment is posted instead.
+```
+GET /api/v4/projects/{id}/jobs/{job_id}/trace        → job log (raw text)
+GET /api/v4/projects/{id}/repository/commits/{sha}/diff → commit diff
+```
 
-### Step 5 — Post MR comment + retry
+The job log is trimmed to the last 100 lines before being sent to Gemini to stay within free-tier token limits.
+
+### 4. Gemini diagnosis — all files at once
+
+The trimmed log and diff (capped at 2 000 chars) are sent to `gemini-2.5-flash` with a system prompt that instructs it to identify **every** file with an error, not just the first. Gemini responds with a `fixes` array:
+
+```json
+{
+  "root_cause": "Multiple flake8 E225 violations across 3 files and W292 in a fourth",
+  "error_type": "lint",
+  "confidence": "high",
+  "human_summary": "Four files had linting issues...",
+  "fixes": [
+    {
+      "file_path": "src/bad_code.py",
+      "fix_description": "Add spaces around = operator",
+      "fix_patch": "@@ -1 +1 @@\n-x=1\n+x = 1\n"
+    },
+    {
+      "file_path": "src/bad_code2.py",
+      "fix_description": "Add spaces around = operator",
+      "fix_patch": "@@ -1 +1 @@\n-my_var=1\n+my_var = 1\n"
+    }
+  ]
+}
+```
+
+File paths are normalised after parsing — leading `./` and `/` are stripped because the GitLab API rejects them.
+
+The agent retries up to 3 times with 30 s / 60 s backoff on `429 RESOURCE_EXHAUSTED`.
+
+### 5. All fixes applied in one commit
+
+```
+For each fix in diagnosis["fixes"]:
+    GET /api/v4/projects/{id}/repository/files/{path}?ref={branch}  → file content
+    apply_unified_diff(original, patch)                              → patched content
+
+POST /api/v4/projects/{id}/repository/commits
+    actions: [
+        {"action": "update", "file_path": "src/bad_code.py",  "content": "..."},
+        {"action": "update", "file_path": "src/bad_code2.py", "content": "..."},
+        ...
+    ]
+→ single commit SHA
+```
+
+No local `git` is required. If a patch produces no change (fix already present), that file is skipped. If all patches are no-ops, a `ValueError` is raised and no commit is made.
+
+### 6. Triage only (low confidence or no patches)
+
+When Gemini cannot produce fix patches with confidence, a triage comment is posted:
+
+```
+🚑 Pipeline Paramedic — Triage Report
+
+Root cause: Unknown error in build step
+
+I was unable to apply an automatic fix with high confidence.
+Please review the job log and apply a manual fix.
+```
+
+### 7. Post comment + retry pipeline
+
+On a successful fix, the MR comment lists every file that was changed:
 
 ```
 🚑 Pipeline Paramedic — Auto-fix Applied
 
-Root cause: flake8 E501 line too long on src/auth.py:42
+Root cause: Multiple flake8 violations across 4 files
 
-I noticed the linter failed due to a line exceeding 120 characters in the
-authentication module. I've pushed commit a3f1b2c8 to wrap the line so
-you can keep working.
+Files fixed (4):
+- `src/bad_code.py`
+- `src/bad_code2.py`
+- `src/bad_code3.py`
+- `src/bad_code4.py`
 
-Automated fix by Pipeline Paramedic
+Pushed commit 8e2d637b and re-triggered the pipeline.
 ```
 
-The pipeline is then retried automatically.
+Then `POST /api/v4/projects/{id}/pipelines/{pipeline_id}/retry` re-queues all failed jobs.
 
 ---
 
 ## Error Types Handled
 
-| Error type | Example | Confidence |
+| Error type | Examples | Typical outcome |
 |---|---|---|
-| Linter (flake8/pylint) | `E501 line too long` | High |
-| Formatter (black/isort) | `would reformat src/app.py` | High |
-| Syntax error | `SyntaxError: invalid syntax` | Medium |
-| Missing import | `ModuleNotFoundError: No module named 'x'` | Medium |
-| Undefined variable | `NameError: name 'x' is not defined` | Medium |
-| Failing unit test | `AssertionError: expected 42 got 0` | Low (triage only) |
+| Linter violation | `E225 missing whitespace`, `E501 line too long` | Auto-fix committed |
+| Formatter | `black would reformat src/app.py` | Auto-fix committed |
+| Syntax error | `SyntaxError: invalid syntax` | Auto-fix if line is clear |
+| Missing import | `ModuleNotFoundError` | Triage comment |
+| Undefined variable | `NameError` | Triage comment |
+| Failing unit test | `AssertionError` | Triage comment |
 
 ---
 
-## Running Tests Locally
+## Running Locally
+
+### Prerequisites
+
+- Python 3.12+
+- A GitLab personal access token with `api` + `write_repository` scopes
+- A Gemini API key from [aistudio.google.com](https://aistudio.google.com) — must use `gemini-2.5-flash` (2.0-flash free tier quota is very limited)
+
+### 1. Clone and set up environment
 
 ```bash
-pip install -r requirements.txt pytest
-pytest tests/ -v
+git clone https://github.com/your-username/pipeline-paramedic
+cd pipeline-paramedic
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+### 2. Configure `.env`
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```env
+GCP_PROJECT_ID=your-gcp-project-id
+GCP_LOCATION=us-central1
+
+GITLAB_URL=https://gitlab.com
+GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+GITLAB_WEBHOOK_SECRET=your-random-secret
+
+GEMINI_API_KEY=AIzaSy...
+
+PORT=8080
+```
+
+### 3. Run the server
+
+```bash
+export $(cat .env | grep -v '^#' | xargs)
+python main.py
+```
+
+Verify it is running:
+
+```bash
+curl http://localhost:8080/health
+# {"service": "pipeline-paramedic", "status": "ok"}
+```
+
+### 4. Send a test webhook
+
+Use real `project_id`, `job_id`, and `commit_sha` values from a GitLab project that has a failing pipeline:
+
+```bash
+curl -X POST http://localhost:8080/webhook/gitlab \
+  -H "Content-Type: application/json" \
+  -H "X-Gitlab-Event: Pipeline Hook" \
+  -H "X-Gitlab-Token: your-random-secret" \
+  -d '{
+    "object_attributes": {
+      "id": 123456,
+      "ref": "main",
+      "sha": "abc123def456",
+      "status": "failed"
+    },
+    "project": {"id": 456, "name": "my-project"},
+    "commit": {"id": "abc123def456"},
+    "builds": [
+      {"id": 789, "name": "lint", "status": "failed"}
+    ]
+  }'
+```
+
+---
+
+## Running Tests
+
+```bash
+source .venv/bin/activate
+python -m pytest tests/ -v
+```
+
+Expected output:
+
+```
+tests/test_paramedic.py::TestApplyUnifiedDiff::test_adds_semicolon       PASSED
+tests/test_paramedic.py::TestApplyUnifiedDiff::test_removes_debug_line   PASSED
+tests/test_paramedic.py::TestApplyUnifiedDiff::test_noop_patch_returns_original PASSED
+tests/test_paramedic.py::TestApplyUnifiedDiff::test_adds_import          PASSED
+tests/test_paramedic.py::TestPipelineParamedic::test_extracts_correct_context   PASSED
+tests/test_paramedic.py::TestPipelineParamedic::test_low_confidence_posts_triage PASSED
+
+6 passed in 0.47s
+```
+
+---
+
+## Deploying to Google Cloud Run
+
+### Prerequisites
+
+- Google Cloud project with billing enabled
+- `gcloud` CLI authenticated (`gcloud auth login`)
+- Terraform >= 1.5
+
+### 1. Provision infrastructure
+
+```bash
+cd terraform
+terraform init
+terraform apply \
+  -var="project_id=your-gcp-project-id" \
+  -var="gitlab_token=glpat-xxxxxxxxxxxxxxxxxxxx" \
+  -var="gitlab_webhook_secret=your-random-secret"
+```
+
+Terraform creates:
+- **Secret Manager secrets** — `gitlab-token`, `webhook-secret`, `gemini-api-key`
+- **Service account** `pipeline-paramedic-sa` with `roles/aiplatform.user` and `roles/secretmanager.secretAccessor`
+- **Cloud Run v2 service** — 512 Mi memory, 0–10 instances, secrets injected as env vars
+
+After apply, note the output:
+
+```
+webhook_url = "https://pipeline-paramedic-xxxx-uc.a.run.app/webhook/gitlab"
+```
+
+### 2. Store the Gemini API key
+
+```bash
+echo -n "AIzaSy..." | gcloud secrets versions add gemini-api-key \
+  --data-file=- \
+  --project=your-gcp-project-id
+```
+
+### 3. Build and deploy
+
+```bash
+gcloud builds submit --config cloudbuild.yaml --project=your-gcp-project-id
+```
+
+Cloud Build runs in order:
+1. `test` — runs `pytest tests/ -v` inside `python:3.12-slim`
+2. `build` — builds the Docker image tagged with `$COMMIT_SHA` and `latest`
+3. `push` — pushes both tags to Container Registry
+4. `deploy` — deploys to Cloud Run with secrets injected
+
+### 4. Configure GitLab webhook
+
+In your GitLab project → **Settings → Webhooks → Add new webhook**:
+
+| Field | Value |
+|---|---|
+| URL | `https://pipeline-paramedic-xxxx-uc.a.run.app/webhook/gitlab` |
+| Secret token | value of `GITLAB_WEBHOOK_SECRET` |
+| Trigger | Pipeline events |
+| SSL verification | Enabled |
+
+> **Note:** GitLab automatically disables a webhook after several consecutive failures (e.g. if the paramedic server is down). Re-enable it under **Settings → Webhooks** after fixing the issue.
+
+---
+
+## Configuring a Target Repository
+
+Add two CI/CD variables to your GitLab project (**Settings → CI/CD → Variables**):
+
+| Variable | Value |
+|---|---|
+| `PARAMEDIC_WEBHOOK_URL` | Your Cloud Run URL (without trailing slash) |
+| `PARAMEDIC_WEBHOOK_SECRET` | Your webhook secret |
+
+Then add `ci/notify.py` to your repo and wire it into the `after_script`:
+
+**`ci/notify.py`** — uses Python's built-in `urllib` (no `curl` required, works in any `python:*` image):
+
+```python
+import json
+import os
+import sys
+import urllib.request
+
+url = os.environ.get("PARAMEDIC_WEBHOOK_URL", "") + "/webhook/gitlab"
+token = os.environ.get("PARAMEDIC_WEBHOOK_SECRET", "")
+mr = os.environ.get("CI_MERGE_REQUEST_IID", "")
+
+body = json.dumps({
+    "object_kind": "pipeline",
+    "object_attributes": {
+        "id": int(os.environ["CI_PIPELINE_ID"]),
+        "ref": os.environ["CI_COMMIT_REF_NAME"],
+        "sha": os.environ["CI_COMMIT_SHA"],
+        "status": "failed",
+    },
+    "project": {
+        "id": int(os.environ["CI_PROJECT_ID"]),
+        "name": os.environ["CI_PROJECT_NAME"],
+    },
+    "builds": [{
+        "id": int(os.environ["CI_JOB_ID"]),
+        "name": os.environ["CI_JOB_NAME"],
+        "status": "failed",
+    }],
+    "commit": {"id": os.environ["CI_COMMIT_SHA"]},
+    "merge_request": {"iid": int(mr)} if mr else None,
+}).encode()
+
+req = urllib.request.Request(url, data=body, headers={
+    "Content-Type": "application/json",
+    "X-Gitlab-Token": token,
+    "X-Gitlab-Event": "Pipeline Hook",
+})
+try:
+    urllib.request.urlopen(req, timeout=10)
+    print("[paramedic] webhook sent")
+except Exception as e:
+    print(f"[paramedic] webhook failed: {e}", file=sys.stderr)
+```
+
+**`.gitlab-ci.yml`** — call `ci/notify.py` from the `after_script`:
+
+```yaml
+.notify_paramedic: &notify_paramedic
+  after_script:
+    - if [ "$CI_JOB_STATUS" = "failed" ]; then python3 ci/notify.py; fi
+
+lint:
+  stage: lint
+  image: python:3.12-slim
+  <<: *notify_paramedic
+  script:
+    - pip install flake8 black isort --quiet
+    - flake8 . --max-line-length=120 --exclude=.git,__pycache__
+    - black --check .
+    - isort --check-only .
+```
+
+> **Why `ci/notify.py` instead of inline `curl`?**
+> `python:slim` images do not include `curl`. Embedding multi-line Python in a YAML block scalar also causes parse errors because unindented Python lines terminate the YAML block. A separate script file avoids both problems.
 
 ---
 
@@ -235,28 +460,86 @@ pytest tests/ -v
 
 | Variable | Required | Description |
 |---|---|---|
-| `GCP_PROJECT_ID` | ✅ | Your Google Cloud project ID |
-| `GITLAB_TOKEN` | ✅ | GitLab personal/project access token (`api` + `write_repository`) |
-| `GITLAB_WEBHOOK_SECRET` | ✅ | Shared secret for webhook verification |
-| `GITLAB_URL` | Optional | GitLab base URL (default: `https://gitlab.com`) |
-| `GCP_LOCATION` | Optional | Vertex AI region (default: `us-central1`) |
-| `PORT` | Optional | HTTP port (default: `8080`) |
+| `GEMINI_API_KEY` | Yes | Gemini API key from [aistudio.google.com](https://aistudio.google.com). Use `gemini-2.5-flash` — the 2.0-flash free tier quota resets daily and is easily exhausted. |
+| `GITLAB_TOKEN` | Yes | GitLab personal or project access token. Needs `api` and `write_repository` scopes. |
+| `GITLAB_WEBHOOK_SECRET` | Yes | Arbitrary secret string. Set the same value in the GitLab webhook config. |
+| `GITLAB_URL` | No | GitLab base URL. Default: `https://gitlab.com`. Override for self-managed instances. |
+| `GCP_PROJECT_ID` | No | GCP project ID. Required only if using Vertex AI mode. |
+| `GCP_LOCATION` | No | GCP region for Vertex AI. Default: `us-central1`. |
+| `PORT` | No | HTTP port the Flask server listens on. Default: `8080`. |
 
 ---
 
-## AWS SAA-C03 Concepts Demonstrated
+## Gemini API — Quota Notes
 
-This project is a practical demonstration of several exam topics:
+The project uses `gemini-2.5-flash` via the Google AI API (`generativelanguage.googleapis.com`). Free tier quota resets daily at midnight Pacific time.
 
-| AWS Concept | GCP Equivalent Used | What It Teaches |
-|---|---|---|
-| CodePipeline / CodeBuild | Cloud Build + Cloud Run | CI/CD pipeline architecture |
-| Lambda (event-driven) | Cloud Run (webhook receiver) | Serverless, event-driven compute |
-| Secrets Manager | GCP Secret Manager | Secure credential storage |
-| IAM Roles | GCP Service Accounts | Least-privilege access control |
-| CloudWatch Logs | Cloud Logging | Observability for pipelines |
-| API Gateway | Cloud Run HTTP endpoint | Webhook / API endpoint patterns |
-| ECS / Fargate | Cloud Run containers | Container-based deployment |
+If you hit `429 RESOURCE_EXHAUSTED`:
+
+- **Enable billing** on the Google Cloud project tied to your API key.
+- **Use a different model** — `gemini-2.5-flash` has separate quota from `gemini-2.0-flash`.
+- **Use Vertex AI mode** — authenticates via Application Default Credentials instead of an API key:
+
+  ```python
+  from google import genai
+  from google.genai.types import HttpOptions
+
+  client = genai.Client(
+      vertexai=True,
+      project="your-gcp-project-id",
+      location="us-central1",
+      http_options=HttpOptions(api_version="v1"),
+  )
+  ```
+
+  Run `gcloud auth application-default login` first. Note: Vertex AI requires the `aiplatform.googleapis.com` API enabled and billing active on the project.
+
+---
+
+## Notable Implementation Decisions
+
+**Multi-file fix in a single commit.** The system prompt instructs Gemini to return a `fixes` array covering every file mentioned in the log. `apply_all_fixes` iterates over all fixes, applies each patch in memory, and calls `create_commit` once with all `actions`. This avoids chaining multiple pipeline triggers for the same failure run.
+
+**No local git clone.** The entire fetch → patch → commit cycle goes through the GitLab REST API. `get_file_content` fetches files, patches are applied in memory by `apply_unified_diff`, and `create_commit` pushes the result. The Cloud Run container stays stateless.
+
+**Unified diff marker handling.** Git diffs include `\ No newline at end of file` as a special marker line starting with `\`. The diff applier skips any line starting with `\` rather than treating it as content, which previously caused patches for `W292` (missing newline) to produce no change.
+
+**File path normalisation.** Gemini sometimes returns file paths with a leading `./` (e.g. `./src/foo.py`). The GitLab API rejects such paths. All `file_path` values in the parsed diagnosis are stripped of leading `./` and `/` before being used.
+
+**Synchronous agent in the webhook handler.** In production this should be offloaded to a task queue (Cloud Tasks, Pub/Sub) so the webhook returns immediately. The current implementation blocks until the agent finishes, which works for fast lint/syntax fixes but may time out on slow Gemini responses.
+
+**Token trimming.** Only the last 100 lines of the job log and the first 2 000 characters of the commit diff are sent to Gemini to stay within free-tier token limits.
+
+**Retry with backoff.** Gemini `429` errors are retried up to 3 times with 30 s and 60 s waits before the exception propagates.
+
+**Graceful MR comment skip.** If `mr_iid` is `None` (no open MR for the branch), the comment step is silently skipped. The fix commit still happens.
+
+**GitLab webhook auto-disable.** GitLab disables a webhook after several consecutive delivery failures. If the paramedic server was down during a failure run, re-enable the webhook under **Settings → Webhooks** and trigger the pipeline manually.
+
+---
+
+## Project Structure
+
+```
+pipeline-paramedic/
+├── main.py                   # Entrypoint — runs Flask app
+├── requirements.txt          # flask, requests, google-genai, gunicorn
+├── Dockerfile                # python:3.12-slim, exposes 8080
+├── cloudbuild.yaml           # test → build → push → Cloud Run deploy
+├── .env.example              # Template for local env config
+├── src/
+│   ├── webhook/
+│   │   └── receiver.py       # Flask routes, token verification
+│   ├── agent/
+│   │   └── paramedic.py      # Core agent — Gemini calls, orchestration
+│   └── tools/
+│       ├── gitlab_tools.py   # GitLab API v4 wrapper
+│       └── code_tools.py     # Unified diff applier, multi-file commit
+├── tests/
+│   └── test_paramedic.py     # Unit tests (6 tests, all passing)
+└── terraform/
+    └── main.tf               # Secret Manager, Service Account, Cloud Run v2
+```
 
 ---
 
